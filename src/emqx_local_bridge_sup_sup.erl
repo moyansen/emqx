@@ -40,7 +40,7 @@ bridges() ->
 start_bridge(Node, Topic) when is_atom(Node), is_binary(Topic) ->
     start_bridge(Node, Topic, []).
 
--spec(start_bridge(node(), emqx_topic:topic(), [emqx_bridge:option()])
+-spec(start_bridge(node(), emqx_topic:topic(), [emqx_local_bridge:option()])
       -> {ok, pid()} | {error, term()}).
 start_bridge(Node, _Topic, _Options) when Node =:= node() ->
     {error, bridge_to_self};
