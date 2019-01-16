@@ -12,9 +12,21 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 
-%% @doc This module implements shuttling of MQTT messages in batch
+%% @doc This module implements the receiver of message batches for portal
 %% between EMQX nodes/clusters.
--module(emqx_shuttle).
+%%
+%% A portal receiver is a gen_statem process which receives messages from
+%% remote peer nodes.
+%%
+%% A portal receiver should work in a pool in order to balance the load.
+%% In order to ensure per-topic message order, the caller should avoid
+%% mapping messages from the same sender ( @see emqx_portal_sender ) to
+%% different receivers in the pool.
 
+-module(emqx_portal_receiver).
 -behaviour(gen_statem).
+
+-export([terminate/3, code_change/4, init/1, callback_mode/0]).
+
+-include("emqx.hrl").
 
