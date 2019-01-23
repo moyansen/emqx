@@ -24,9 +24,5 @@
 %% different receivers in the pool.
 
 -module(emqx_portal_receiver).
--behaviour(gen_statem).
-
--export([terminate/3, code_change/4, init/1, callback_mode/0]).
-
 -include("emqx.hrl").
 
