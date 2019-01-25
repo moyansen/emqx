@@ -22,18 +22,17 @@
 -type connection() :: term().
 -type conn_ref() :: reference().
 -type batch() :: emqx_protal:batch().
--type batch_ref() :: emqx_portal:batch_ref().
 
 %% establish the connection to remote node/cluster
 %% protal worker (the caller process) should be expecting
 %% a message {disconnected, conn_ref()} when disconnected.
--callback start(config()) -> {ok, conn_ref(), connect()} | {error, any()}.
+-callback start(config()) -> {ok, conn_ref(), connection()} | {error, any()}.
 
 %% publish to remote node/cluster
 %% portal worker (the caller process) should be expecting
-%% a message {batch_ack, batch_ref()} when batch is acknowledged by remote node/cluster
--callback publish(connection(), batch_ref(), batch()) -> ok | {error, any()}.
+%% a message {batch_ack, reference()} when batch is acknowledged by remote node/cluster
+-callback publish(connection(), batch()) -> {ok, reference()} | {error, any()}.
 
 %% called when owner is shutting down.
--callback stop(connect()) -> ok.
+-callback stop(connection()) -> ok.
 

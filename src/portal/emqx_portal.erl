@@ -40,6 +40,9 @@
 -module(emqx_portal).
 -behaviour(gen_statem).
 
+%% APIs
+-export([start_link/1]).
+
 %% gen_statem callbacks
 -export([terminate/3, code_change/4, init/1, callback_mode/0]).
 
@@ -53,15 +56,14 @@
 -type batch() :: [emqx_types:message()].
 -type batch_ref() :: replayq:ack_ref().
 
--include("emqx.hrl").
--include("emqx_mqtt.hrl").
 -include("logger.hrl").
+-include("emqx_mqtt.hrl").
 
 -define(DEFAULT_BATCH_COUNT, 100).
 -define(DEFAULT_BATCH_BYTES, 1 bsl 20).
 -define(DEFAULT_SEND_AHEAD, 8).
 -define(DEFAULT_RECONNECT_DELAY_MS, timer:seconds(5)).
--define(keep_sending, {next_event, internal, send}).
+-define(keep_sending, {next_event, internal, try_publish}).
 
 start_link(Options) ->
     Name = maps:get(portal_name, Options),
@@ -74,9 +76,7 @@ init(Options) ->
     erlang:process_flag(trap_exit, true),
     Get = fun(K, D) -> maps:get(K, Options, D) end,
     QueueConfig = Get(queue_config, #{mem_only => true}),
-    Queue = replayq:open(QueueConfig#{sizer => fun msg_sizer/1,
-                                      marshaller => fun msg_marshaller/1
-                                     }),
+    Queue = replayq:open(QueueConfig#{marshaller => fun msg_marshaller/1}),
     Topics = Get(forwards, []),
     ok = subscribe_local_topics(Topics),
     {ok, connecting,
@@ -86,7 +86,7 @@ init(Options) ->
        batch_bytes_limit => Get(batch_bytes_limit, ?DEFAULT_BATCH_BYTES),
        batch_count_limit => Get(batch_count_limit, ?DEFAULT_BATCH_COUNT),
        max_inflight_batches => Get(max_inflight_batches, ?DEFAULT_SEND_AHEAD),
-       mountpoint => Get(mountpoint, undefined),
+       mountpoint => format_mountpoint(Get(mountpoint, undefined)),
        topics => Topics,
        replayq => Queue,
        inflight => []
@@ -115,7 +115,7 @@ connecting(enter, _OldState, #{connect_module := ConnMod,
             ?ERROR("Failed to connect with module=~p config=~p\nreason:~p",
                    [ConnMod, ConnCfg, Reason]),
             Action = {state_timeout, Timeout, reconnect},
-            {keep_state, State, State}
+            {keep_state, State, Action}
     end;
 connecting(state_timeout, reconnect, State) ->
     %% enter connecting state again to start state timer
@@ -124,8 +124,8 @@ connecting(Type, Content, State) ->
     common(connecting, Type, Content, State).
 
 %% @doc Send batches to remote node/cluster when in 'connected' state.
-connected(enter, OldState, #{} = State) when OldState =:= disconnect ->
-    case retry_inflight(State) of
+connected(enter, _OldState, #{inflight := Inflight} = State) ->
+    case retry_inflight(State#{inflight := []}, Inflight) of
         {ok, NewState} ->
             {keep_state, NewState, ?keep_sending};
         {error, NewState} ->
@@ -154,8 +154,9 @@ connected(Type, Content, State) ->
     common(connected, Type, Content, State).
 
 %% Common handlers
-common(_StateName, info, {dispatch, _, #message{} = Msg}, #{replayq := Q} = State) ->
-    NewQ = replayq:append(Q, collect([transform(Msg)])),
+common(_StateName, info, {dispatch, _, Msg},
+       #{replayq := Q} = State) ->
+    NewQ = replayq:append(Q, [transform(M) || M <- collect([Msg])]),
     {keep_state, State#{replayq => NewQ}, ?keep_sending};
 common(StateName, Type, Content, State) ->
     ?INFO("Ignored unknown ~p event ~p at state ~p", [Type, Content, StateName]),
@@ -163,27 +164,23 @@ common(StateName, Type, Content, State) ->
 
 collect(Acc) ->
     receive
-        {dispatch, _, #message{} = Msg} ->
-            collect([transform(Msg) | Acc])
+        {dispatch, _, Msg} ->
+            collect([Msg | Acc])
     after
         0 ->
             lists:reverse(Acc)
     end.
 
 %% Retry all inflight (previously sent but not acked) batches.
-retry_inflight(#{inflight := Inflight} = State) ->
-    F = fun({AckRef, Batch}) ->
-                case try_publish(State, AckRef, Batch) of
-                    ok -> ok;
-                    {error, Reason} -> erlang:throw(retry_failed, Reason)
-                end
-        end,
-    try
-        lists:foreach(F, Inflight)
-    catch
-        throw : {retry_failed, Reason} ->
-            ?INFO("Inflight retry failed\n~p", [Reason]),
-            error
+retry_inflight(State, []) -> {ok, State};
+retry_inflight(#{inflight := Inflight} = State,
+               [#{q_ack_ref := QAckRef, batch := Batch} | T] = Remain) ->
+    case do_publish(State, QAckRef, Batch) of
+        {ok, NewState} ->
+            retry_inflight(NewState, T);
+        {error, Reason} ->
+            ?ERROR("Inflight retry failed\n~p", [Reason]),
+            {error, State#{inflight := Inflight ++ Remain}}
     end.
 
 pop_and_send(#{inflight := Inflight,
@@ -199,17 +196,22 @@ pop_and_send(#{replayq := Q,
             {ok, State};
         false ->
             Opts = #{count_limit => CountLimit, bytes_limit => BytesLimit},
-            {Q1, AckRef, Batch} = replayq:pop(Q, Opts),
-            case try_publish(State, AckRef, Batch) of
-                ok ->
-                    NewInflight = Inflight ++ [{AckRef, Batch}],
-                    {ok, State#{replayq := Q1,
-                                inflight := NewInflight
-                               }};
-                {error, Reason} ->
-                    ?INFO("Batch produce failed\n~p", [Reason]),
-                    {error, State}
-            end
+            {Q1, QAckRef, Batch} = replayq:pop(Q, Opts),
+            do_publish(State#{replayq := Q1}, QAckRef, Batch)
+    end.
+
+%% Assert non-empty batch because we have a is_empty check earlier.
+do_publish(State = #{inflight := Inflight}, QAckRef, [_ | _] = Batch) ->
+    case try_publish(State, Batch) of
+        {ok, Ref} ->
+            NewInflight = Inflight ++ [#{q_ack_ref => QAckRef,
+                                         publish_ack_ref => Ref,
+                                         batch => Batch
+                                        }],
+            {ok, State#{inflight := NewInflight}};
+        {error, Reason} ->
+            ?INFO("Batch produce failed\n~p", [Reason]),
+            {error, State}
     end.
 
 subscribe_local_topics(Topics) ->
@@ -222,39 +224,34 @@ subscribe_local_topics(Topics) ->
 
 name() -> {_, Name} = process_info(self(), registered_name), Name.
 
-disconnect(#{connection => Conn,
-             connect_module => Module
-            }) ->
+disconnect(#{connection := Conn,
+             connect_module := Module
+            } = State) ->
     case Conn =:= undefined of
         true ->
             ok = Module:stop(Conn),
-            State#{conn_ref => undefined, connection => udnefined};
+            State#{conn_ref => undefined,
+                   connection => udnefined
+                  };
         false ->
             State
     end.
 
-transform(#message{topic = Topic,
-                   payload = Payload,
-                   flags = #{retain := Retain}},
-          #{mountpoint := Mountpoint} = State) ->
-    #mqtt_msg{qos = 1,
-              retain = Retain,
-              topic = mountpoint(Mountpoint, Topic),
-              payload = Payload
-             }.
+transform(Msg) -> emqx_portal_msg:from_dispatch_msg(Msg).
 
-msg_marshaller(#mqtt_msg{} = Msg) -> erlang:term_to_binary(Msg);
-msg_marshaller(Bin) -> #mqtt_msg{} = erlang:binary_to_term(Bin).
+%% Called only when replayq needs to dump it to disk.
+msg_marshaller(Bin) when is_binary(Bin) -> emqx_portal_msg:from_binary(Bin);
+msg_marshaller(Msg) -> emqx_portal_msg:to_binary(Msg).
 
-%% estimate message size only by topic length and payload size
-msg_sizer(#mqtt_msg{topic = Topic, payload = Payload}) ->
-    erlang:iolist_size([Topic, Payload]).
-
-mountpoint(undefined, Topic) -> Topic;
-mountpoint(Prefix, Topic) -> <<Prefix/binary, Topic/binary>>.
-
+%% Return ok or {error, Reason}
 try_publish(#{connect_module := Module,
-              connection := Connection
-             }, AckRef, Batch) ->
-    Module:publish(Connection, BatchRef, Batch).
+              connection := Connection,
+              mountpoint := Mountpoint
+             }, Batch) ->
+    Module:publish(Connection, [emqx_portal_msg:apply_mountpoint(M, Mountpoint) || M <- Batch]).
+
+format_mountpoint(undefined) ->
+    undefined;
+format_mountpoint(Prefix) ->
+    binary:replace(iolist_to_binary(Prefix), <<"${node}">>, atom_to_binary(node(), utf8)).
 
