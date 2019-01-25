@@ -18,6 +18,7 @@
 
 -include("emqx.hrl").
 -include("emqx_mqtt.hrl").
+-include("emqx_client.hrl").
 
 -import(proplists, [get_value/2, get_value/3]).
 
@@ -41,9 +42,6 @@
                 queue_option       :: map(),
                 forwards           :: list(),
                 subscriptions      :: list()}).
-
--record(mqtt_msg, {qos = ?QOS_0, retain = false, dup = false,
-                   packet_id, topic, props, payload}).
 
 start_link(Name, Options) ->
     gen_server:start_link({local, name(Name)}, ?MODULE, [Options], []).
