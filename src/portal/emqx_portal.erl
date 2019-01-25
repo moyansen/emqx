@@ -237,7 +237,7 @@ do_publish(State = #{inflight := Inflight}, QAckRef, [_ | _] = Batch) ->
     end.
 
 subscribe_local_topics(Topics) ->
-    lists:froeach(
+    lists:foreach(
       fun(Topic0) ->
               Topic = iolist_to_binary(Topic0),
               emqx_topic:validate({filter, Topic}) orelse erlang:error({bad_topic, Topic}),
