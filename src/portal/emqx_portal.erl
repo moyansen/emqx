@@ -41,7 +41,7 @@
 -behaviour(gen_statem).
 
 %% APIs
--export([start_link/1]).
+-export([start_link/2]).
 
 %% gen_statem callbacks
 -export([terminate/3, code_change/4, init/1, callback_mode/0]).
@@ -63,10 +63,27 @@
 -define(DEFAULT_BATCH_BYTES, 1 bsl 20).
 -define(DEFAULT_SEND_AHEAD, 8).
 -define(DEFAULT_RECONNECT_DELAY_MS, timer:seconds(5)).
+-define(DEFAULT_SEG_BYTES, (1 bsl 20)).
 -define(keep_sending, {next_event, internal, try_publish}).
 
-start_link(Options) ->
-    Name = maps:get(portal_name, Options),
+%% @doc Start a portal worker. Supported options:
+%% connect_module: The module which implements emqx_portal_connect behaviour
+%%      and work as message batch transport layer
+%% connect_config: Config for eqmx_portal_connect, transparent to this module
+%% reconnect_delay_ms: Delay in milli-seconds for the portal worker to retry
+%%      in case of transportation failure.
+%% batch_bytes_limit: Max number of bytes to collect in a batch for each
+%%      publish call towards emqx_portal_connect
+%% batch_count_limit: Max number of messages to collect in a batch for
+%%      each publish call towards eqmx_portal_connect
+%% max_inflight_batches: Max number of batches allowed to send-ahead before
+%%      receiving confirmation from remote node/cluster
+%% mountpoint: The topic mount point for messages sent to remote node/cluster
+%%      'default' or <<>> to indicate none
+%% forwards: Local topics to subscribe.
+%% replayq_dir: Directory where replayq should persist messages
+%% replayq_seg_bytes: Size in bytes for each replqyq segnment file
+start_link(Name, Options) ->
     gen_statem:start_link({local, Name}, ?MODULE, Options).
 
 callback_mode() -> [state_functions, state_enter].
@@ -75,7 +92,13 @@ callback_mode() -> [state_functions, state_enter].
 init(Options) ->
     erlang:process_flag(trap_exit, true),
     Get = fun(K, D) -> maps:get(K, Options, D) end,
-    QueueConfig = Get(queue_config, #{mem_only => true}),
+    QueueConfig =
+        case Get(replayq_dir, undefned) of
+            undefined -> #{mem_only => true};
+            Dir -> #{dir => Dir,
+                     seg_bytes => Get(replayq_seg_bytes, ?DEFAULT_SEG_BYTES)
+                    }
+        end,
     Queue = replayq:open(QueueConfig#{marshaller => fun msg_marshaller/1}),
     Topics = Get(forwards, []),
     ok = subscribe_local_topics(Topics),
@@ -149,7 +172,6 @@ connected(info, {disconnected, ConnRef}, #{conn_ref := ConnRefNow} = State) ->
             ?INFO("Stale disconnect info ~p discarded", [ConnRef]),
             {keep_state, State}
     end;
-
 connected(Type, Content, State) ->
     common(connected, Type, Content, State).
 
